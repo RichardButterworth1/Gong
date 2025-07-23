@@ -6,7 +6,9 @@ import base64
 app = Flask(__name__)
 
 def get_auth_header():
-    return {"Authorization": f"Bearer {GONG_API_KEY}"}
+    creds = f"{GONG_API_KEY}:{GONG_API_SECRET}"
+    b64_creds = base64.b64encode(creds.encode()).decode()
+    return {"Authorization": f"Bearer {b64_creds}"}
 
 @app.route("/insights", methods=["GET"])
 def get_insights():
