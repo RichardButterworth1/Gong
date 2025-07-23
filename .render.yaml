@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: gong-api-wrapper
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python app.py
+    envVars:
+      - key: GONG_API_KEY
+        sync: false
+      - key: GONG_API_SECRET
+        sync: false
+    routes:
+      - type: http
+        name: get-insights
+        path: /insights
+        methods: [GET]
+        description: >
+          Unified endpoint to fetch Gong data:
+          - topic=calls
+          - topic=deals
+          - topic=deal (with deal_id)
+          - topic=deal_calls (with deal_id)
+          - topic=highlights or transcript (with call_id)
