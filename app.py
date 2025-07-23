@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-from config import GONG_API_BASE, GONG_API_KEY, GONG_API_SECRET
+from config import GONG_API_BASE, GONG_API_KEY
 import requests, base64, logging, datetime
 
 app = Flask(__name__)
@@ -10,10 +10,7 @@ _user_cache = None
 _deal_cache = None
 
 def get_auth_header():
-    """Return Basic Auth header for Gong API using API key/secret."""
-    creds = f"{GONG_API_KEY}:{GONG_API_SECRET}"
-    token = base64.b64encode(creds.encode()).decode()
-    return {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    return {"Authorization": f"Bearer {GONG_API_KEY}", "Content-Type": "application/json"}
 
 def fetch_all_users():
     """Retrieve all users from Gong and cache them."""
