@@ -13,12 +13,17 @@ def get_auth_header():
 @app.route("/insights", methods=["GET"])
 def get_insights():
     topic = request.args.get("topic", "calls")
-    endpoint = f"{GONG_API_BASE}/v2/{topic}"
+    call_id = request.args.get("call_id")
 
-    # Pass through all user query parameters (e.g., limit, page, rep, date)
+    # Handle nested endpoints like highlights and transcript
+    if topic in ["highlights", "transcript"] and call_id:
+        endpoint = f"{GONG_API_BASE}/v2/calls/{call_id}/{topic}"
+    else:
+        endpoint = f"{GONG_API_BASE}/v2/{topic}"
+
     params = request.args.to_dict()
+    params.pop("call_id", None)  # Don't send call_id as a query param
 
-    # Set sensible defaults to prevent large payloads
     if "limit" not in params:
         params["limit"] = 10
     if "page" not in params:
@@ -30,6 +35,5 @@ def get_insights():
         return jsonify(response.json())
     except requests.exceptions.RequestException as e:
         return jsonify({"error": str(e), "status_code": response.status_code}), response.status_code
-
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
