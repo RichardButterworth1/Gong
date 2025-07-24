@@ -1,335 +1,422 @@
-from flask import Flask, request, jsonify
-from config import GONG_API_BASE, GONG_API_KEY
+from flask import Flask, request, jsonify, abort
+from config import GONG_API_BASE_URL, GONG_API_KEY, GONG_API_SECRET
 import requests, base64, logging, datetime
 
 app = Flask(__name__)
-logging.basicConfig(level=logging.INFO)  # Configure logging
+logging.basicConfig(level=logging.INFO)  # Configure logging for info and errors
 
-# Simple in-memory caches for users and deals to avoid repetitive API calls
+# Initialize a session for reusing TCP connection and setting auth
+session = requests.Session()
+# Use HTTP Basic Auth for all requests with the provided Gong API credentials
+session.auth = (GONG_API_KEY, GONG_API_SECRET)
+
+# Simple in-memory caches to avoid redundant API calls
 _user_cache = None
 _deal_cache = None
 
-def get_auth_header():
-    return {"Authorization": f"Bearer {GONG_API_KEY}", "Content-Type": "application/json"}
-
 def fetch_all_users():
-    """Retrieve all users from Gong and cache them."""
+    """Retrieve all users from Gong (with pagination) and cache them."""
     global _user_cache
     if _user_cache is not None:
         return _user_cache
-    _user_cache = []
-    page = 1
-    per_page = 100
+    users = []
+    url = f"{GONG_API_BASE_URL}/v2/users"
+    params = {"limit": 100}  # try to get up to 100 per page (max allowed)
     while True:
-        url = f"{GONG_API_BASE}/v2/users"
-        params = {"limit": per_page, "page": page}
-        resp = requests.get(url, headers=get_auth_header(), params=params)
+        resp = session.get(url, params=params)
         if resp.status_code != 200:
             app.logger.error(f"Failed to fetch users: {resp.status_code} - {resp.text}")
             break
         data = resp.json()
-        users = data.get("users") or data.get("items") or data  # accommodate different structures
-        if not users:
+        # Gong may return users list under different keys or directly as list
+        page_users = data.get("users") or data.get("items") or (data if isinstance(data, list) else [])
+        if not page_users:
             break
-        _user_cache.extend(users)
-        # If less than requested or no pagination info, break
-        if len(users) < per_page or not data.get("hasMore"):
+        users.extend(page_users)
+        # Check if there's more data (could be via 'cursor' token or hasMore flag)
+        cursor = data.get("cursor")
+        has_more = data.get("hasMore")
+        if cursor:
+            params = {"cursor": cursor}       # use cursor for next page if provided
+        elif has_more or (has_more is None and len(page_users) == 100):
+            # If hasMore is true (or unknown but we got a full page), attempt next page number
+            params["page"] = params.get("page", 1) + 1
+        else:
             break
-        page += 1
-    app.logger.info(f"Cached {_user_cache and len(_user_cache)} Gong users")
-    return _user_cache
+    _user_cache = users
+    app.logger.info(f"Cached {len(users)} Gong users.")
+    return users
 
 def get_user_id_by_name(name):
-    """Find a Gong user ID by name (case-insensitive). Returns None if not found or ambiguous."""
-    users = fetch_all_users()
-    if not name or not users:
+    """Find a Gong user ID by (case-insensitive) name."""
+    if not name:
         return None
-    name_lower = name.lower()
-    matches = [u for u in users if name_lower in u.get("name", "").lower()]
+    users = fetch_all_users()
+    name = name.lower()
+    matches = [u for u in users if u.get("name","").lower() == name or name in u.get("name","").lower()]
     if not matches:
         return None
-    # If multiple matches, prefer exact full name match or the first match
-    exact_matches = [u for u in matches if u.get("name", "").lower() == name_lower]
-    user = (exact_matches or matches)[0]
-    return user.get("id")
-
-def fetch_deals_page(page=1, per_page=100):
-    """Fetch one page of deals from Gong."""
-    url = f"{GONG_API_BASE}/v2/deals"
-    params = {"limit": per_page, "page": page}
-    resp = requests.get(url, headers=get_auth_header(), params=params)
-    if resp.status_code != 200:
-        app.logger.error(f"Failed to fetch deals: {resp.status_code} - {resp.text}")
-        return None
-    return resp.json()
+    # If multiple matches, prefer exact or first match
+    return matches[0].get("id")
 
 def fetch_all_deals():
-    """Retrieve all deals from Gong and cache them."""
+    """Retrieve all deals from Gong (with pagination) and cache them."""
     global _deal_cache
     if _deal_cache is not None:
         return _deal_cache
-    _deal_cache = []
-    page = 1
-    per_page = 100
+    deals = []
+    url = f"{GONG_API_BASE_URL}/v2/deals"
+    params = {"limit": 100}
     while True:
-        data = fetch_deals_page(page, per_page)
-        if not data:
+        resp = session.get(url, params=params)
+        if resp.status_code != 200:
+            app.logger.error(f"Failed to fetch deals: {resp.status_code} - {resp.text}")
             break
-        deals = data.get("deals") or data.get("items") or data
-        if not deals:
+        data = resp.json()
+        page_deals = data.get("deals") or data.get("items") or (data if isinstance(data, list) else [])
+        if not page_deals:
             break
-        _deal_cache.extend(deals)
-        if len(deals) < per_page or not data.get("hasMore"):
+        deals.extend(page_deals)
+        cursor = data.get("cursor")
+        has_more = data.get("hasMore")
+        if cursor:
+            params = {"cursor": cursor}
+        elif has_more or (has_more is None and len(page_deals) == 100):
+            params["page"] = params.get("page", 1) + 1
+        else:
             break
-        page += 1
-    app.logger.info(f"Cached {_deal_cache and len(_deal_cache)} Gong deals")
-    return _deal_cache
+    _deal_cache = deals
+    app.logger.info(f"Cached {len(deals)} Gong deals.")
+    return deals
 
 def get_deal_ids_by_name(company_name):
-    """Find deal IDs by company name (matches accountName or deal name). Returns list of IDs."""
-    deals = fetch_all_deals()
-    if not company_name or not deals:
+    """Find Gong deal IDs by company (account) name or deal name (case-insensitive)."""
+    if not company_name:
         return []
-    name_lower = company_name.lower()
-    # Match accountName or name (case-insensitive contains or equals)
+    deals = fetch_all_deals()
+    name = company_name.lower()
+    # First look for exact matches on accountName or deal name
     matches = [d for d in deals 
-               if (d.get("accountName","").lower() == name_lower) or 
-                  (d.get("name","").lower() == name_lower)]
+               if d.get("accountName","").lower() == name or d.get("name","").lower() == name]
     if not matches:
-        # Try partial matches if no exact
-        matches = [d for d in deals if name_lower in d.get("accountName","").lower() 
-                                     or name_lower in d.get("name","").lower()]
-    ids = [d.get("id") for d in matches if d.get("id")]
-    return ids
+        # Fallback: partial match
+        matches = [d for d in deals 
+                   if name in d.get("accountName","").lower() or name in d.get("name","").lower()]
+    return [d.get("id") for d in matches if d.get("id")]
 
-def format_date_param(date_str, end_of_day=False):
-    """Convert a date string to ISO date-time format for Gong API (append time if missing)."""
-    # If already looks like ISO timestamp, use as is
-    if not date_str:
+def format_datetime(dt_str, end_of_day=False):
+    """Format a date or datetime string to ISO 8601 as required by Gong API."""
+    if not dt_str:
         return None
     try:
-        # If it's a date (YYYY-MM-DD), add time component
-        if len(date_str) == 10 and date_str[4] == '-' and date_str[7] == '-':
-            if end_of_day:
-                # set to end of day UTC
-                return date_str + "T23:59:59Z"
-            else:
-                return date_str + "T00:00:00Z"
-        # If it's a parseable date-time, we trust it
-        datetime.datetime.fromisoformat(date_str.replace("Z",""))
-        return date_str
+        # If input is just a date (YYYY-MM-DD), append time (start or end of day)
+        if len(dt_str) == 10 and dt_str[4] == '-' and dt_str[7] == '-':
+            return dt_str + ("T23:59:59Z" if end_of_day else "T00:00:00Z")
+        # If it's already a full datetime string, pass through (assuming ISO format)
+        datetime.datetime.fromisoformat(dt_str.replace("Z", ""))  # validate format
+        return dt_str
     except Exception:
-        app.logger.warning(f"Unrecognized date format: {date_str}")
+        app.logger.warning(f"Unrecognized date format: {dt_str}")
         return None
 
-@app.route("/insights", methods=["GET"])
-def get_insights():
-    topic = request.args.get("topic", "calls")  # default to 'calls' list if not specified
-    salesperson = request.args.get("salesperson")
-    company = request.args.get("company")
-    from_date = request.args.get("fromDate")
-    to_date = request.args.get("toDate")
-    call_id = request.args.get("call_id")
-    deal_id = request.args.get("deal_id")
-
-    # Prepare filters
-    user_id = None
-    deal_ids = []
-    if salesperson:
-        user_id = get_user_id_by_name(salesperson)
-        if not user_id:
-            app.logger.info(f"Salesperson '{salesperson}' not found – ignoring salesperson filter")
-    if company:
-        # If deal_id is explicitly provided, use it directly; otherwise find by name
-        if not deal_id:
-            deal_ids = get_deal_ids_by_name(company)
-            if not deal_ids:
-                app.logger.info(f"Company '{company}' not found – ignoring company filter")
-        else:
-            deal_ids = [deal_id]
-
-    # Date filters formatting
-    from_dt = format_date_param(from_date)
-    to_dt = format_date_param(to_date, end_of_day=True)
-
+@app.route("/users", methods=["GET"])
+def list_users():
+    """List all Gong users."""
     try:
-        if topic in ["transcript", "transcripts"]:
-            # Retrieve call transcripts (POST /v2/calls/transcript)
-            body = {"filter": {}}
-            if from_dt or to_dt:
-                # Use date range filter if provided
-                body["filter"]["fromDateTime"] = from_dt or "1970-01-01T00:00:00Z"
-                body["filter"]["toDateTime"] = to_dt or datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            if call_id:
-                # If a specific call_id is given, filter by it
-                body["filter"]["callIds"] = [call_id]
-            elif deal_ids:
-                # If company filter exists, get all calls for those deals, then filter transcripts by those call IDs
-                call_ids = []
-                for d_id in deal_ids:
-                    resp = requests.get(f"{GONG_API_BASE}/v2/deals/{d_id}/calls", headers=get_auth_header())
-                    if resp.status_code == 200:
-                        calls_data = resp.json()
-                        calls_list = calls_data.get("calls") or calls_data.get("items") or calls_data
-                        for c in calls_list:
-                            call_ids.append(c.get("id"))
-                if call_ids:
-                    body["filter"]["callIds"] = call_ids
-            if user_id:
-                # If user filter, fetch calls by user (in date range) and filter by those IDs
-                # (Gong transcripts API does not directly filter by user, so we do it via call list)
-                calls_url = f"{GONG_API_BASE}/v2/calls"
+        users = fetch_all_users()
+        # Return only relevant fields for brevity
+        result = [{"id": u.get("id"), "name": u.get("name"), "email": u.get("email")} for u in users]
+        return jsonify({"users": result})
+    except requests.RequestException as e:
+        return _handle_request_exception(e)
+
+@app.route("/calls", methods=["GET"])
+def list_calls():
+    """List calls with optional filters by rep (salesperson), deal (company), and date range."""
+    salesperson = request.args.get("repName") or request.args.get("salesperson")
+    rep_id = request.args.get("repId") or request.args.get("userId")
+    company = request.args.get("dealName") or request.args.get("company")
+    deal_id = request.args.get("dealId")
+    from_date = request.args.get("from")
+    to_date = request.args.get("to")
+    try:
+        # Resolve rep_id from name if provided
+        if rep_id is None and salesperson:
+            rep_id = get_user_id_by_name(salesperson)
+            if rep_id is None:
+                app.logger.info(f"Salesperson '{salesperson}' not found.")
+        # Resolve deal IDs from company name if provided
+        deal_ids = []
+        if company:
+            deal_ids = get_deal_ids_by_name(company) if not deal_id else [deal_id]
+            if not deal_ids:
+                app.logger.info(f"Company '{company}' not found in deals.")
+        elif deal_id:
+            deal_ids = [deal_id]
+        # Format date filters
+        from_dt = format_datetime(from_date)
+        to_dt = format_datetime(to_date, end_of_day=True)
+        calls = []
+        if deal_ids:
+            # Fetch calls for each specified deal
+            for d_id in deal_ids:
+                url = f"{GONG_API_BASE_URL}/v2/deals/{d_id}/calls"
+                params = {"limit": 100}
+                if from_dt: params["fromDateTime"] = from_dt
+                if to_dt: params["toDateTime"] = to_dt
+                # Loop through pages of calls for this deal
+                while True:
+                    resp = session.get(url, params=params)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    page_calls = data.get("calls") or data.get("items") or (data if isinstance(data, list) else [])
+                    if not page_calls:
+                        break
+                    calls.extend(page_calls)
+                    cursor = data.get("cursor")
+                    has_more = data.get("hasMore")
+                    if cursor:
+                        params = {"cursor": cursor}
+                    elif has_more or (has_more is None and len(page_calls) == 100):
+                        params["page"] = params.get("page", 1) + 1
+                    else:
+                        break
+        else:
+            # If no deal filter, fetch recent calls (with date range if provided)
+            url = f"{GONG_API_BASE_URL}/v2/calls"
+            params = {}
+            if from_dt: params["fromDateTime"] = from_dt
+            if to_dt: params["toDateTime"] = to_dt
+            # If no date filters given, limit to a small number of recent calls by default
+            if not from_dt and not to_dt:
+                params["limit"] = 10
+            # Page through results
+            while True:
+                resp = session.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                page_calls = data.get("calls") or data.get("items") or (data if isinstance(data, list) else [])
+                if not page_calls:
+                    break
+                calls.extend(page_calls)
+                cursor = data.get("cursor")
+                has_more = data.get("hasMore")
+                if cursor:
+                    params = {"cursor": cursor}
+                elif has_more or (has_more is None and len(page_calls) == (params.get("limit", 100))):
+                    # If limit was set, use it; otherwise 100 is default page size
+                    params["page"] = params.get("page", 1) + 1
+                else:
+                    break
+        # Apply rep filter on the collected calls (if rep specified)
+        if rep_id:
+            calls = [c for c in calls 
+                     if c.get("primaryUserId") == rep_id or c.get("userId") == rep_id]
+        # If multiple deals were matched by name, you may have duplicate call entries – dedupe by ID
+        unique_calls = {}
+        for c in calls:
+            unique_calls[c.get("id")] = c
+        # Return the list of calls (basic info only for brevity)
+        result = []
+        for c in unique_calls.values():
+            result.append({
+                "id": c.get("id"),
+                "startTime": c.get("startTime"),
+                "title": c.get("title") or c.get("description"),
+                "primaryUserId": c.get("primaryUserId") or c.get("userId"),
+                "dealId": c.get("dealId") or (c.get("deal", {}).get("id") if c.get("deal") else None)
+            })
+        # Sort results by startTime descending (most recent first) for convenience
+        result.sort(key=lambda x: x.get("startTime", ""), reverse=True)
+        return jsonify({"calls": result})
+    except requests.RequestException as e:
+        return _handle_request_exception(e)
+
+@app.route("/calls/detailed", methods=["GET"])
+def get_call_details():
+    """Retrieve detailed call data (AI content like summary, highlights) for calls."""
+    salesperson = request.args.get("repName") or request.args.get("salesperson")
+    rep_id = request.args.get("repId") or request.args.get("userId")
+    company = request.args.get("dealName") or request.args.get("company")
+    deal_id = request.args.get("dealId")
+    call_id = request.args.get("callId") or request.args.get("call_id")
+    from_date = request.args.get("from")
+    to_date = request.args.get("to")
+    try:
+        # Resolve filters similar to above
+        if rep_id is None and salesperson:
+            rep_id = get_user_id_by_name(salesperson)
+        deal_ids = []
+        if company:
+            deal_ids = get_deal_ids_by_name(company) if not deal_id else [deal_id]
+        elif deal_id:
+            deal_ids = [deal_id]
+        from_dt = format_datetime(from_date)
+        to_dt = format_datetime(to_date, end_of_day=True)
+        # Build request body for extensive API
+        body = {"filter": {}, "contentSelector": {"include": ["CONTENT"]}}
+        if from_dt or to_dt:
+            body["filter"]["fromDateTime"] = from_dt or "1970-01-01T00:00:00Z"
+            body["filter"]["toDateTime"] = to_dt or datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        if call_id:
+            # If a specific call is requested, filter by that call ID
+            body["filter"]["callIds"] = [call_id]
+        elif deal_ids:
+            # If filtering by company/deal, get all call IDs for those deals (optionally also by rep)
+            all_call_ids = []
+            for d_id in deal_ids:
+                resp = session.get(f"{GONG_API_BASE_URL}/v2/deals/{d_id}/calls")
+                resp.raise_for_status()
+                calls_data = resp.json()
+                calls_list = calls_data.get("calls") or calls_data.get("items") or calls_data
+                for c in (calls_list or []):
+                    # If rep filter also given, include only calls where this user is the primary user
+                    if not rep_id or c.get("primaryUserId") == rep_id or c.get("userId") == rep_id:
+                        all_call_ids.append(c.get("id"))
+            if all_call_ids:
+                body["filter"]["callIds"] = list(set(all_call_ids))  # deduplicate
+        if rep_id and "callIds" not in body["filter"]:
+            # Filter by rep (primary user) at the API level if we haven't narrowed by callIds
+            body["filter"]["primaryUserIds"] = [rep_id]
+        if not body["filter"]:
+            # If no filters at all were provided, default to the latest call
+            body["filter"]["limit"] = 1
+            app.logger.info("No filters provided for detailed call data; defaulting to latest call.")
+        # Call the extensive API to get detailed call info
+        endpoint = f"{GONG_API_BASE_URL}/v2/calls/extensive"
+        resp = session.post(endpoint, json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        calls_data = data.get("calls") or data.get("items") or data
+        # Construct a clean response focusing on key insights
+        result_calls = []
+        for c in calls_data:
+            info = {
+                "id": c.get("id"),
+                "startTime": c.get("startTime"),
+                "topic": c.get("title") or c.get("description"),
+                "salesperson": c.get("primaryUser", {}).get("name") if c.get("primaryUser") else None,
+                "company": c.get("deal", {}).get("accountName") if c.get("deal") else None
+            }
+            content = c.get("content", {})
+            if content:
+                # Include AI summary and outline if present
+                if "brief" in content:
+                    info["summary"] = content["brief"]
+                if "outline" in content:
+                    info["outline"] = content["outline"]
+                # Include Next Steps (and potentially other highlights)
+                if "highlights" in content:
+                    highlights = content["highlights"]
+                    if "nextSteps" in highlights:
+                        info["nextSteps"] = highlights["nextSteps"]
+                    # (Other highlight categories can be added as needed)
+            result_calls.append(info)
+        return jsonify({"calls": result_calls})
+    except requests.RequestException as e:
+        return _handle_request_exception(e)
+
+@app.route("/calls/transcripts", methods=["GET"])
+def get_transcripts():
+    """Retrieve call transcript(s) for given filters or date range."""
+    salesperson = request.args.get("repName") or request.args.get("salesperson")
+    rep_id = request.args.get("repId") or request.args.get("userId")
+    company = request.args.get("dealName") or request.args.get("company")
+    deal_id = request.args.get("dealId")
+    call_id = request.args.get("callId") or request.args.get("call_id")
+    from_date = request.args.get("from")
+    to_date = request.args.get("to")
+    try:
+        # Resolve rep and deal similar to above
+        if rep_id is None and salesperson:
+            rep_id = get_user_id_by_name(salesperson)
+        deal_ids = []
+        if company:
+            deal_ids = get_deal_ids_by_name(company) if not deal_id else [deal_id]
+        elif deal_id:
+            deal_ids = [deal_id]
+        from_dt = format_datetime(from_date)
+        to_dt = format_datetime(to_date, end_of_day=True)
+        # Build filter for transcript request
+        filter_obj = {}
+        if from_dt or to_dt:
+            filter_obj["fromDateTime"] = from_dt or "1970-01-01T00:00:00Z"
+            filter_obj["toDateTime"] = to_dt or datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        if call_id:
+            filter_obj["callIds"] = [call_id]
+        elif deal_ids:
+            # If filtering by deal, fetch all call IDs for those deals within date range (if any)
+            call_ids = []
+            for d_id in deal_ids:
+                url = f"{GONG_API_BASE_URL}/v2/deals/{d_id}/calls"
                 params = {}
                 if from_dt: params["fromDateTime"] = from_dt
                 if to_dt: params["toDateTime"] = to_dt
-                params["limit"] = 50
-                params["page"] = 1
-                resp = requests.get(calls_url, headers=get_auth_header(), params=params)
-                if resp.status_code == 200:
-                    calls_data = resp.json()
-                    calls_list = calls_data.get("calls") or calls_data.get("items") or calls_data
-                    user_call_ids = [c.get("id") for c in calls_list 
-                                     if c.get("primaryUserId")==user_id or c.get("userId")==user_id]
-                    if user_call_ids:
-                        body["filter"].setdefault("callIds", []).extend(user_call_ids)
-            # If no filters at all provided (dangerous to pull all transcripts), default to last 7 days
-            if not body["filter"]:
-                to_dt_def = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-                from_dt_def = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%00:00:00Z")
-                body["filter"]["fromDateTime"] = from_dt_def
-                body["filter"]["toDateTime"] = to_dt_def
-                app.logger.info("No filters provided for transcripts; defaulting to last 7 days")
-            # Make the POST request to Gong transcripts API
-            endpoint = f"{GONG_API_BASE}/v2/calls/transcript"
-            response = requests.post(endpoint, headers=get_auth_header(), json=body)
-            response.raise_for_status()
-            data = response.json()
-            # Optionally remove any superfluous fields (keeping callTranscripts)
-            result = {"callTranscripts": data.get("callTranscripts", data)}
-            return jsonify(result)
+                resp = session.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                calls_list = data.get("calls") or data.get("items") or data
+                for c in (calls_list or []):
+                    call_ids.append(c.get("id"))
+            if call_ids:
+                filter_obj["callIds"] = list(set(call_ids))
+        if rep_id:
+            if "callIds" in filter_obj:
+                # If we already have specific call IDs (from deal filter), narrow them by rep
+                filter_obj["callIds"] = [cid for cid in filter_obj["callIds"] 
+                                         if _call_belongs_to_user(cid, rep_id)]
+            else:
+                # If no callIds specified, we cannot directly filter transcripts by user via API,
+                # so we will handle it by retrieving all transcripts in range and then filtering below.
+                pass  # We'll handle rep filter after fetching transcripts.
+        # Default to last 7 days if no filter provided (to avoid pulling all transcripts)
+        if not filter_obj:
+            to_dt_def = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+            from_dt_def = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            filter_obj = {"fromDateTime": from_dt_def, "toDateTime": to_dt_def}
+            app.logger.info("No filters provided for transcripts; defaulting to last 7 days.")
+        # Call the transcripts API
+        endpoint = f"{GONG_API_BASE_URL}/v2/calls/transcript"
+        resp = session.post(endpoint, json={"filter": filter_obj})
+        resp.raise_for_status()
+        data = resp.json()
+        transcripts = data.get("callTranscripts") or data.get("items") or data
+        # If we still need to apply a rep filter (and we didn't filter by callIds already)
+        if rep_id and "callIds" not in filter_obj:
+            transcripts = [t for t in transcripts if _transcript_belongs_to_user(t, rep_id)]
+        return jsonify({"callTranscripts": transcripts})
+    except requests.RequestException as e:
+        return _handle_request_exception(e)
 
-        elif topic in ["highlights", "summary", "extensive"]:
-            # Retrieve AI content (summary/highlights) via extensive call API (POST /v2/calls/extensive)
-            # Build filter for calls of interest
-            body = {"filter": {}, "contentSelector": {"include": ["CONTENT"]}}
-            if from_dt or to_dt:
-                body["filter"]["fromDateTime"] = from_dt or "1970-01-01T00:00:00Z"
-                body["filter"]["toDateTime"] = to_dt or datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-            # If specific call_id provided, filter by it
-            if call_id:
-                body["filter"]["callIds"] = [call_id]
-            # If company filter (deal_ids), gather calls from those deals
-            all_call_ids = []
-            if deal_ids:
-                for d_id in deal_ids:
-                    resp = requests.get(f"{GONG_API_BASE}/v2/deals/{d_id}/calls", headers=get_auth_header())
-                    if resp.status_code == 200:
-                        calls_data = resp.json()
-                        calls_list = calls_data.get("calls") or calls_data.get("items") or calls_data
-                        for c in calls_list:
-                            # If user filter also given, only include calls by that user
-                            if not user_id or (c.get("primaryUserId")==user_id or c.get("userId")==user_id):
-                                all_call_ids.append(c.get("id"))
-            if all_call_ids:
-                body["filter"]["callIds"] = all_call_ids
-            # If user filter given (and no specific call_ids from above), use it
-            if user_id and not body["filter"].get("callIds"):
-                body["filter"]["primaryUserIds"] = [user_id]
-            # If no specific filters at all and no call_id, default to the most recent call
-            if not body["filter"]:
-                body["filter"]["limit"] = 1  # get the latest call
-                app.logger.info("No filters provided; defaulting to the latest call for summary/highlights")
-            endpoint = f"{GONG_API_BASE}/v2/calls/extensive"
-            response = requests.post(endpoint, headers=get_auth_header(), json=body)
-            response.raise_for_status()
-            data = response.json()
-            calls = data.get("calls") or data.get("items") or data
-            # Prepare a cleaned response focusing on key insights
-            result_calls = []
-            for c in calls:
-                call_info = {
-                    "id": c.get("id"),
-                    "startTime": c.get("startTime"),
-                    "topic": c.get("title") or c.get("description"),
-                    "salesperson": c.get("primaryUser", {}).get("name") if c.get("primaryUser") else None,
-                    "company": c.get("deal", {}).get("accountName") if c.get("deal") else None
-                }
-                # Extract AI content if present
-                content = c.get("content", {})
-                if content:
-                    # Summary brief and outline
-                    if "brief" in content:
-                        call_info["summary"] = content["brief"]
-                    if "outline" in content:
-                        call_info["outline"] = content["outline"]
-                    # Highlights (next steps, etc.)
-                    if "highlights" in content:
-                        highlights = content["highlights"]
-                        if "nextSteps" in highlights:
-                            call_info["nextSteps"] = highlights["nextSteps"]
-                        # (Other highlight fields could be added here if needed)
-                result_calls.append(call_info)
-            return jsonify({"calls": result_calls})
+def _call_belongs_to_user(call_id, user_id):
+    """Helper to check if a given call's primary user (owner) matches the user_id."""
+    try:
+        resp = session.get(f"{GONG_API_BASE_URL}/v2/calls/{call_id}")
+        if resp.status_code == 200:
+            call = resp.json()
+            puid = call.get("primaryUserId") or call.get("userId") or (call.get("primaryUser", {}) or {}).get("id")
+            return puid == user_id
+    except requests.RequestException:
+        pass
+    return False
 
-        elif topic == "deal" and (deal_id or deal_ids):
-            # If specific deal ID provided or found, get that deal’s details
-            target_deal = deal_id or (deal_ids[0] if deal_ids else None)
-            endpoint = f"{GONG_API_BASE}/v2/deals/{target_deal}"
-            response = requests.get(endpoint, headers=get_auth_header())
-            response.raise_for_status()
-            return jsonify(response.json())
+def _transcript_belongs_to_user(transcript_record, user_id):
+    """Helper to check if a transcript record corresponds to a call owned by user_id."""
+    # Transcript records typically include callId and speaker info. We check call ownership via call metadata.
+    call_id = transcript_record.get("callId") or transcript_record.get("id")
+    return _call_belongs_to_user(call_id, user_id)
 
-        elif topic in ["deal_calls"] and (deal_id or deal_ids):
-            # List calls for a given deal ID
-            target_deal = deal_id or (deal_ids[0] if deal_ids else None)
-            endpoint = f"{GONG_API_BASE}/v2/deals/{target_deal}/calls"
-            params = {"limit": 10, "page": 1}
-            if from_dt: params["fromDateTime"] = from_dt
-            if to_dt: params["toDateTime"] = to_dt
-            response = requests.get(endpoint, headers=get_auth_header(), params=params)
-            response.raise_for_status()
-            return jsonify(response.json())
-
-        elif topic == "deals":
-            # List deals, optionally filtered by salesperson or company
-            deals_data = fetch_all_deals()
-            filtered = []
-            for d in deals_data:
-                if user_id:
-                    owner_id = d.get("owner", {}).get("id") or d.get("userId")
-                    if owner_id != user_id:
-                        continue
-                if company and company.lower() not in (d.get("accountName","").lower() + d.get("name","").lower()):
-                    continue
-                filtered.append(d)
-            # Limit to first 10 results by default
-            result_deals = filtered[:10] if len(filtered) > 10 else filtered
-            return jsonify({"deals": result_deals})
-
-        else:
-            # Default: topic "calls" (or unknown topic) -> list recent calls, possibly filtered
-            url = f"{GONG_API_BASE}/v2/calls"
-            params = {"limit": 10, "page": 1}
-            if from_dt: params["fromDateTime"] = from_dt
-            if to_dt: params["toDateTime"] = to_dt
-            response = requests.get(url, headers=get_auth_header(), params=params)
-            response.raise_for_status()
-            calls_data = response.json()
-            calls_list = calls_data.get("calls") or calls_data.get("items") or calls_data
-            # Filter calls by user or company if provided
-            result_calls = []
-            for c in calls_list:
-                if user_id and c.get("primaryUserId") != user_id and c.get("userId") != user_id:
-                    continue
-                if deal_ids and c.get("dealId") not in deal_ids:
-                    continue
-                result_calls.append(c)
-            return jsonify({"calls": result_calls})
-    except requests.exceptions.RequestException as e:
-        # Log the error and return JSON error message
-        app.logger.error(f"Error handling /insights request: {e}")
-        status = getattr(e.response, "status_code", 500) if hasattr(e, 'response') else 500
-        return jsonify({"error": str(e), "status_code": status}), status
+def _handle_request_exception(e):
+    """Generic error handler for requests exceptions to return JSON error."""
+    status = getattr(e.response, "status_code", 500) if hasattr(e, "response") else 500
+    error_body = None
+    try:
+        error_body = e.response.json() if hasattr(e, "response") else None
+    except Exception:
+        error_body = e.response.text if hasattr(e, "response") else None
+    app.logger.error(f"[Gong API Error] {status} - {str(e)} - Details: {error_body}")
+    return jsonify({"error": str(e), "status_code": status, "details": error_body}), status
 
 if __name__ == "__main__":
+    # Run the app (for local testing; in production, a WSGI server like gunicorn would be used)
     app.run(host="0.0.0.0", port=5000)
